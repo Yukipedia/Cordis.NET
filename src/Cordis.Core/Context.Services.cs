@@ -138,18 +138,54 @@ public sealed partial class Context
     private void RebindRealms(Action mutation)
     {
         var bindings = _runtime.Services.ToArray();
+        var realmsBefore = new Dictionary<string, object>(_realms, StringComparer.Ordinal);
+        var parentBefore = _scopeParent;
+
         mutation();
-        foreach (var pair in bindings)
-            if (!ReferenceEquals(pair.Key, pair.Value.Context.Realm(pair.Value.Name)))
-                _runtime.Services.Remove(pair.Key);
-        foreach (var pair in bindings)
+
+        try
         {
-            var realm = pair.Value.Context.Realm(pair.Value.Name);
-            if (!_runtime.Services.TryGetValue(realm, out var existing))
-                _runtime.Services.Add(realm, pair.Value);
-            else if (!ReferenceEquals(existing, pair.Value))
-                throw new InvalidOperationException(
-                    $"Service '{pair.Value.Name}' is already registered in the destination realm.");
+            // Plan the destinations before touching the shared table. Detaching an incumbent
+            // entry and then reporting a conflict would leave the survivor's owner still
+            // active while its binding is gone, which no caller can observe or recover.
+            var destinations = new Dictionary<object, ServiceEntry>(ReferenceEqualityComparer.Instance);
+            var moves = new List<(object Source, object Target, ServiceEntry Entry)>();
+
+            foreach (var pair in bindings)
+                if (ReferenceEquals(pair.Key, pair.Value.Context.Realm(pair.Value.Name)))
+                    destinations[pair.Key] = pair.Value;
+
+            foreach (var pair in bindings)
+            {
+                var realm = pair.Value.Context.Realm(pair.Value.Name);
+                if (ReferenceEquals(pair.Key, realm))
+                    continue;
+
+                if (destinations.TryGetValue(realm, out var incumbent))
+                    throw new InvalidOperationException(
+                        $"Service '{pair.Value.Name}' is already registered in the destination realm.");
+
+                moves.Add((pair.Key, realm, pair.Value));
+                destinations[realm] = pair.Value;
+            }
+
+            // Two phases: every stale source is released before any destination is written,
+            // so a swap of two destinations ends with both entries registered.
+            foreach (var move in moves)
+                _runtime.Services.Remove(move.Source);
+
+            foreach (var move in moves)
+                _runtime.Services[move.Target] = move.Entry;
+        }
+        catch
+        {
+            _realms.Clear();
+
+            foreach (var pair in realmsBefore)
+                _realms[pair.Key] = pair.Value;
+
+            _scopeParent = parentBefore;
+            throw;
         }
 
         foreach (var fiber in _runtime.Plugins.Values.SelectMany(p => p.Fibers).ToArray())
